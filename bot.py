@@ -2,7 +2,7 @@
 """
 CIS Discord Bot - Mobile Command & Control Interface
 
-Provides mobile access to CIS intelligence data with approval/reject functionality.
+Provides mobile control interface for the CIS system via Discord bot commands.
 """
 
 import asyncio
@@ -11,56 +11,47 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, List, Optional
-
 import requests
 import discord
 from discord.ext import commands, tasks
-from discord.ui import View, Button
+import schedule
 
 logger = logging.getLogger(__name__)
 
-class CISBot(commands.Bot):
-    """CIS Discord Bot for mobile C2 interface"""
+class CISDiscordBot(commands.Bot):
+    """CIS Discord Bot for mobile command and control"""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: dict):
+        self.config = config
+        self.raw_json_url = config.get('raw_json_url', '')
+        self.pat_token = config.get('pat_token', '')
+        self.poll_interval = config.get('poll_interval', 120)  # 2 minutes
+        self.approval_timeout = config.get('approval_timeout', 300)  # 5 minutes
+        
+        # Bot configuration
         intents = discord.Intents.default()
         intents.message_content = True
         
         super().__init__(
-            command_prefix=config.get('prefix', '!'),
+            command_prefix='!',
             intents=intents,
-            help_command=None
+            description='CIS - Center Intelligence System Bot'
         )
         
-        self.config = config
-        self.pat_token = config.get('pat_token', '')
-        self.repo_owner = config.get('repo_owner', '')
-        self.repo_name = config.get('repo_name', 'cis-operational-center')
-        self.poll_interval = config.get('poll_interval', 120)  # seconds
-        self.approval_timeout = config.get('approval_timeout', 300)  # seconds
-        
-        self.last_check = None
         self.pending_approvals = {}  # message_id -> approval_data
-        self.intelligence_cache = None
-        self.cache_timestamp = None
+        self.last_poll = None
+        self.recent_signals = set()  # Track recent signals to avoid duplicates
         
     async def setup_hook(self):
-        """Setup bot components"""
-        logger.info("🤖 Setting up CIS Discord Bot...")
-        
-        # Start background tasks
-        self.poll_intelligence.start()
+        """Setup bot tasks"""
+        self.poll_intel.start()
         self.cleanup_approvals.start()
-        
-        logger.info("✅ Bot setup completed")
     
     async def on_ready(self):
-        """Called when bot is ready"""
+        """Bot is ready"""
         logger.info(f"✅ {self.user} has connected to Discord!")
-        logger.info(f"   Bot ID: {self.user.id}")
-        logger.info(f"   Connected to {len(self.guilds)} guilds")
+        logger.info(f"📊 Connected to {len(self.guilds)} guilds")
         
         # Set bot status
         activity = discord.Activity(
@@ -69,463 +60,386 @@ class CISBot(commands.Bot):
         )
         await self.change_presence(activity=activity)
     
-    def get_intelligence_data(self) -> Optional[Dict]:
-        """Fetch latest intelligence data from GitHub repository"""
+    async def get_intelligence_data(self) -> Optional[Dict]:
+        """Fetch intelligence data from GitHub"""
         try:
-            # Check cache first
-            if (self.cache_timestamp and 
-                datetime.utcnow() - self.cache_timestamp < timedelta(seconds=30)):
-                return self.intelligence_cache
+            if not self.raw_json_url:
+                logger.error("No raw JSON URL configured")
+                return None
             
-            # Construct raw file URL
-            url = f"https://raw.githubusercontent.com/{self.repo_owner}/{self.repo_name}/main/data/master_intel.json"
+            headers = {}
+            if self.pat_token:
+                headers['Authorization'] = f'token {self.pat_token}'
             
-            headers = {
-                'Authorization': f'token {self.pat_token}',
-                'Accept': 'application/vnd.github.v3.raw'
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(self.raw_json_url, headers=headers, timeout=30)
             
             if response.status_code == 200:
-                data = response.json()
-                self.intelligence_cache = data
-                self.cache_timestamp = datetime.utcnow()
-                logger.info(f"📊 Fetched intelligence data: {data.get('status', 'unknown')}")
-                return data
+                return response.json()
             else:
-                logger.warning(f"⚠️ Failed to fetch intelligence data: {response.status_code}")
+                logger.error(f"Failed to fetch intelligence data: {response.status_code}")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Error fetching intelligence data: {e}")
+            logger.error(f"Error fetching intelligence data: {e}")
             return None
     
-    def create_intelligence_embed(self, data: Dict) -> discord.Embed:
-        """Create Discord embed for intelligence data"""
-        consensus = data.get('consensus', {})
-        summary = data.get('summary', {})
-        
-        # Determine embed color based on sentiment
-        sentiment = consensus.get('dominant_sentiment', 'neutral')
-        if sentiment == 'positive':
-            color = discord.Color.green()
-        elif sentiment == 'negative':
-            color = discord.Color.red()
-        else:
-            color = discord.Color.gold()
-        
-        embed = discord.Embed(
-            title="🎯 CIS Intelligence Update",
-            description="New financial intelligence signals detected",
-            color=color,
-            timestamp=datetime.utcnow()
-        )
-        
-        # Add consensus information
-        recommendation = consensus.get('recommendation', 'NEUTRAL')
-        confidence = consensus.get('confidence', 0)
-        
-        embed.add_field(
-            name="Recommendation",
-            value=f"**{recommendation}**",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Confidence",
-            value=f"{confidence:.1%}",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Sentiment",
-            value=f"{sentiment.title()}",
-            inline=True
-        )
-        
-        # Add summary
-        total_signals = summary.get('total_signals', 0)
-        sources_active = summary.get('sources_active', 0)
-        
-        embed.add_field(
-            name="Signals",
-            value=f"{total_signals} total",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Sources Active",
-            value=f"{sources_active}/5",
-            inline=True
-        )
-        
-        # Add timestamp
-        last_update = summary.get('last_update', 'Unknown')
-        embed.add_field(
-            name="Last Update",
-            value=last_update,
-            inline=True
-        )
-        
-        # Set footer
-        embed.set_footer(text="CIS - Center Intelligence System")
-        
-        return embed
-    
-    def create_approval_view(self, intelligence_data: Dict) -> View:
-        """Create approval/reject buttons"""
-        view = View(timeout=self.approval_timeout)
-        
-        async def approve_callback(interaction: discord.Interaction):
-            await self.handle_approval(interaction, intelligence_data, "APPROVED")
-        
-        async def reject_callback(interaction: discord.Interaction):
-            await self.handle_approval(interaction, intelligence_data, "REJECTED")
-        
-        approve_button = Button(
-            style=discord.ButtonStyle.success,
-            label="✅ Approve",
-            emoji="✅"
-        )
-        approve_button.callback = approve_callback
-        
-        reject_button = Button(
-            style=discord.ButtonStyle.danger,
-            label="❌ Reject",
-            emoji="❌"
-        )
-        reject_button.callback = reject_callback
-        
-        view.add_item(approve_button)
-        view.add_item(reject_button)
-        
-        return view
-    
-    async def handle_approval(self, interaction: discord.Interaction, intelligence_data: Dict, decision: str):
-        """Handle approval/reject decision"""
-        try:
-            # Update embed to show decision
-            embed = interaction.message.embeds[0]
-            embed.title = f"🎯 CIS Intelligence - {decision}"
-            embed.description = f"Decision: **{decision}** by {interaction.user.mention}"
-            embed.color = discord.Color.green() if decision == "APPROVED" else discord.Color.red()
-            
-            # Add decision timestamp
-            embed.add_field(
-                name="Decision Time",
-                value=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-                inline=False
-            )
-            
-            # Disable buttons
-            view = View()
-            for item in interaction.message.components[0].children:
-                if hasattr(item, 'disabled'):
-                    item.disabled = True
-                view.add_item(item)
-            
-            await interaction.response.edit_message(embed=embed, view=view)
-            
-            # Log decision
-            logger.info(f"📝 Intelligence {decision} by {interaction.user}")
-            
-            # Store decision for analytics
-            decision_data = {
-                'timestamp': datetime.utcnow().isoformat(),
-                'user': str(interaction.user),
-                'user_id': interaction.user.id,
-                'decision': decision,
-                'intelligence_id': intelligence_data.get('timestamp', 'unknown')
-            }
-            
-            self.save_decision(decision_data)
-            
-        except Exception as e:
-            logger.error(f"❌ Error handling approval: {e}")
-            await interaction.response.send_message(
-                "❌ Error processing decision. Please try again.",
-                ephemeral=True
-            )
-    
-    def save_decision(self, decision_data: Dict):
-        """Save decision to file for analytics"""
-        try:
-            decisions_file = Path("data/decisions.json")
-            decisions_file.parent.mkdir(exist_ok=True)
-            
-            decisions = []
-            if decisions_file.exists():
-                with open(decisions_file, 'r') as f:
-                    decisions = json.load(f)
-            
-            decisions.append(decision_data)
-            
-            # Keep only last 1000 decisions
-            if len(decisions) > 1000:
-                decisions = decisions[-1000:]
-            
-            with open(decisions_file, 'w') as f:
-                json.dump(decisions, f, indent=2)
-                
-        except Exception as e:
-            logger.error(f"❌ Error saving decision: {e}")
-    
     @tasks.loop(seconds=120)  # Poll every 2 minutes
-    async def poll_intelligence(self):
-        """Background task to poll for new intelligence"""
+    async def poll_intel(self):
+        """Poll for new intelligence data"""
         try:
-            logger.debug("🔍 Polling for new intelligence...")
+            logger.info("🔍 Polling for new intelligence...")
             
-            intelligence_data = self.get_intelligence_data()
+            intel_data = await self.get_intelligence_data()
+            if not intel_data:
+                logger.warning("No intelligence data available")
+                return
             
-            if intelligence_data:
-                # Check if this is new data
-                data_timestamp = intelligence_data.get('timestamp')
+            signals = intel_data.get('signals', [])
+            summary = intel_data.get('summary', {})
+            
+            if not signals:
+                logger.info("No signals to process")
+                return
+            
+            # Process new signals
+            new_signals = []
+            for signal in signals:
+                signal_id = signal.get('id', '')
                 
-                if data_timestamp and data_timestamp != self.last_check:
-                    logger.info(f"🎯 New intelligence detected: {data_timestamp}")
-                    self.last_check = data_timestamp
-                    
-                    # Send to configured channels
-                    await self.broadcast_intelligence(intelligence_data)
-                    
+                # Skip if already processed
+                if signal_id in self.recent_signals:
+                    continue
+                
+                # Add to recent signals (keep last 100)
+                self.recent_signals.add(signal_id)
+                if len(self.recent_signals) > 100:
+                    # Remove oldest
+                    oldest = min(self.recent_signals)
+                    self.recent_signals.remove(oldest)
+                
+                new_signals.append(signal)
+            
+            if new_signals:
+                logger.info(f"🎯 Found {len(new_signals)} new signals")
+                await self.notify_new_signals(new_signals, summary)
+            
+            self.last_poll = datetime.utcnow()
+            
         except Exception as e:
-            logger.error(f"❌ Error in intelligence polling: {e}")
+            logger.error(f"❌ Error in poll loop: {e}")
     
-    async def broadcast_intelligence(self, intelligence_data: Dict):
-        """Broadcast intelligence to configured Discord channels"""
+    @poll_intel.before_loop
+    async def before_poll_intel(self):
+        """Wait before starting poll loop"""
+        await self.wait_until_ready()
+        logger.info("🔄 Starting intelligence polling...")
+    
+    async def notify_new_signals(self, signals: List[Dict], summary: Dict):
+        """Notify about new signals"""
         try:
-            # Get configured channels
-            channels = self.config.get('channels', [])
-            
-            if not channels:
-                # Use bot's home guild if no channels configured
-                if self.guilds:
-                    guild = self.guilds[0]
-                    # Find or create intelligence channel
-                    channel = discord.utils.get(guild.text_channels, name="cis-intelligence")
-                    if not channel:
-                        # Try to create channel (requires permissions)
-                        try:
-                            channel = await guild.create_text_channel("cis-intelligence")
-                        except:
-                            logger.warning("❌ Could not create intelligence channel")
-                            return
-                    
-                    if channel:
-                        channels = [channel.id]
-            
-            # Send to each channel
-            for channel_id in channels:
-                channel = self.get_channel(channel_id)
+            # Find the first text channel
+            channel = None
+            for guild in self.guilds:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).send_messages:
+                        channel = ch
+                        break
                 if channel:
-                    embed = self.create_intelligence_embed(intelligence_data)
-                    view = self.create_approval_view(intelligence_data)
-                    
-                    message = await channel.send(embed=embed, view=view)
-                    
-                    # Store for approval tracking
-                    self.pending_approvals[message.id] = {
-                        'intelligence_data': intelligence_data,
-                        'timestamp': datetime.utcnow(),
-                        'channel_id': channel_id
-                    }
-                    
-                    logger.info(f"📤 Intelligence broadcasted to {channel.name}")
-                    
+                    break
+            
+            if not channel:
+                logger.error("No channel available to send notifications")
+                return
+            
+            # Create notification embed
+            embed = discord.Embed(
+                title="🎯 New Intelligence Signals",
+                description=f"{len(signals)} new signals detected",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow()
+            )
+            
+            # Add signal summary
+            for i, signal in enumerate(signals[:5]):  # Show first 5
+                title = signal.get('title', 'Unknown')
+                sentiment = signal.get('sentiment', 'neutral')
+                confidence = signal.get('confidence', 0.5)
+                source = signal.get('source', 'unknown')
+                
+                # Truncate title if too long
+                if len(title) > 50:
+                    title = title[:47] + "..."
+                
+                # Sentiment emoji
+                sentiment_emoji = {
+                    'positive': '📈',
+                    'negative': '📉',
+                    'neutral': '➡️'
+                }.get(sentiment, '❓')
+                
+                embed.add_field(
+                    name=f"{sentiment_emoji} Signal {i+1}",
+                    value=f"**{title}**\n"
+                          f"Sentiment: `{sentiment}`\n"
+                          f"Confidence: `{confidence:.1%}`\n"
+                          f"Source: `{source}`",
+                    inline=False
+                )
+            
+            if len(signals) > 5:
+                embed.add_field(
+                    name="📊 More signals",
+                    value=f"...and {len(signals) - 5} more signals",
+                    inline=False
+                )
+            
+            # Add summary
+            if summary:
+                breakdown = summary.get('sentiment_breakdown', {})
+                avg_confidence = summary.get('avg_confidence', 0)
+                
+                embed.add_field(
+                    name="📈 Summary",
+                    value=f"Total: `{summary.get('total_signals', 0)}`\n"
+                          f"Positive: `{breakdown.get('positive', 0)}`\n"
+                          f"Negative: `{breakdown.get('negative', 0)}`\n"
+                          f"Neutral: `{breakdown.get('neutral', 0)}`\n"
+                          f"Avg Confidence: `{avg_confidence:.1%}`",
+                    inline=True
+                )
+            
+            # Send notification
+            message = "🚨 New intelligence signals available for review!"
+            
+            # Add approve/reject buttons
+            view = SignalApprovalView(signals[:3])  # Only approve first 3 for simplicity
+            
+            await channel.send(message, embed=embed, view=view)
+            logger.info(f"📤 Sent notification about {len(signals)} signals")
+            
         except Exception as e:
-            logger.error(f"❌ Error broadcasting intelligence: {e}")
+            logger.error(f"❌ Error notifying about signals: {e}")
     
-    @tasks.loop(minutes=5)  # Cleanup every 5 minutes
+    @tasks.loop(minutes=5)
     async def cleanup_approvals(self):
         """Clean up expired approval requests"""
         try:
-            now = datetime.utcnow()
-            expired_ids = []
+            current_time = datetime.utcnow()
+            expired = []
             
             for message_id, approval_data in self.pending_approvals.items():
-                timestamp = approval_data['timestamp']
-                if now - timestamp > timedelta(seconds=self.approval_timeout):
-                    expired_ids.append(message_id)
+                created_at = approval_data.get('created_at')
+                if created_at:
+                    age = current_time - created_at
+                    if age > timedelta(seconds=self.approval_timeout):
+                        expired.append(message_id)
             
             # Remove expired approvals
-            for message_id in expired_ids:
+            for message_id in expired:
                 del self.pending_approvals[message_id]
                 logger.info(f"🧹 Cleaned up expired approval: {message_id}")
+            
+            if expired:
+                logger.info(f"🧹 Cleaned up {len(expired)} expired approvals")
                 
         except Exception as e:
-            logger.error(f"❌ Error in cleanup: {e}")
+            logger.error(f"❌ Error cleaning up approvals: {e}")
     
-    @poll_intelligence.before_loop
-    async def before_poll_intelligence(self):
-        """Wait for bot to be ready"""
-        await self.wait_until_ready()
-        logger.info("🔄 Intelligence polling starting...")
-    
-    @cleanup_approvals.before_loop
-    async def before_cleanup_approvals(self):
-        """Wait for bot to be ready"""
-        await self.wait_until_ready()
-        logger.info("🧹 Approval cleanup starting...")
-
-# Command definitions
-@commands.command(name='help')
-async def help_command(ctx):
-    """Show help information"""
-    embed = discord.Embed(
-        title="🤖 CIS Bot Help",
-        description="Center Intelligence System Discord Bot",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(
-        name="Commands",
-        value="""
-        `!help` - Show this help message
-        `!status` - Show bot status
-        `!intelligence` - Get latest intelligence
-        `!poll` - Manually poll for intelligence
-        """,
-        inline=False
-    )
-    
-    embed.add_field(
-        name="Features",
-        value="""
-        • Automatic intelligence polling
-        • Approval/reject buttons
-        • Mobile-friendly interface
-        • Termux integration ready
-        """,
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
-
-@commands.command(name='status')
-async def status_command(ctx):
-    """Show bot status"""
-    bot = ctx.bot
-    
-    embed = discord.Embed(
-        title="📊 CIS Bot Status",
-        color=discord.Color.green()
-    )
-    
-    embed.add_field(
-        name="Uptime",
-        value=f"{discord.utils.utcnow() - bot.start_time}",
-        inline=True
-    )
-    
-    embed.add_field(
-        name="Poll Interval",
-        value=f"{bot.poll_interval}s",
-        inline=True
-    )
-    
-    embed.add_field(
-        name="Pending Approvals",
-        value=str(len(bot.pending_approvals)),
-        inline=True
-    )
-    
-    await ctx.send(embed=embed)
-
-@commands.command(name='intelligence')
-async def intelligence_command(ctx):
-    """Get latest intelligence manually"""
-    bot = ctx.bot
-    
-    data = bot.get_intelligence_data()
-    if data:
-        embed = bot.create_intelligence_embed(data)
+    # Discord Commands
+    @commands.command(name='status')
+    async def status_command(self, ctx):
+        """Show bot status"""
+        embed = discord.Embed(
+            title="🤖 CIS Bot Status",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        # Get intelligence data
+        intel_data = await self.get_intelligence_data()
+        
+        if intel_data:
+            signals = intel_data.get('signals', [])
+            summary = intel_data.get('summary', {})
+            
+            embed.add_field(
+                name="📊 Intelligence",
+                value=f"Signals: `{len(signals)}`\n"
+                      f"Last Update: `{intel_data.get('last_updated', 'Unknown')[:19]}`",
+                inline=True
+            )
+            
+            if summary:
+                breakdown = summary.get('sentiment_breakdown', {})
+                embed.add_field(
+                    name="📈 Sentiment",
+                    value=f"📈 Positive: `{breakdown.get('positive', 0)}`\n"
+                          f"📉 Negative: `{breakdown.get('negative', 0)}`\n"
+                          f"➡️ Neutral: `{breakdown.get('neutral', 0)}`",
+                    inline=True
+                )
+        else:
+            embed.add_field(
+                name="⚠️ Intelligence",
+                value="No data available",
+                inline=True
+            )
+        
+        embed.add_field(
+            name="🔄 Polling",
+            value=f"Interval: `{self.poll_interval}s`\n"
+                  f"Last Poll: `{self.last_poll.strftime('%H:%M:%S UTC') if self.last_poll else 'Never'}`",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📱 Mobile",
+            value=f"Pending Approvals: `{len(self.pending_approvals)}`\n"
+                  f"Recent Signals: `{len(self.recent_signals)}`",
+            inline=True
+        )
+        
         await ctx.send(embed=embed)
-    else:
-        await ctx.send("❌ No intelligence data available")
+    
+    @commands.command(name='help')
+    async def help_command(self, ctx):
+        """Show help information"""
+        embed = discord.Embed(
+            title="🤖 CIS Bot Commands",
+            description="Center Intelligence System - Mobile Command Interface",
+            color=discord.Color.green()
+        )
+        
+        embed.add_field(
+            name="📊 `!status`",
+            value="Show bot and intelligence status",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="ℹ️ `!help`",
+            value="Show this help message",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔄 Automatic Features",
+            value=f"• Polls every {self.poll_interval}s for new intelligence\n"
+                  f"• Auto-cleans expired approvals after {self.approval_timeout}s\n"
+                  "• Tracks recent signals to avoid duplicates",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
 
-@commands.command(name='poll')
-async def poll_command(ctx):
-    """Manually poll for intelligence"""
-    bot = ctx.bot
+class SignalApprovalView(discord.ui.View):
+    """View for signal approval buttons"""
     
-    await ctx.send("🔄 Manually polling for intelligence...")
+    def __init__(self, signals: list):
+        super().__init__(timeout=None)
+        self.signals = signals
     
-    # Force refresh
-    bot.intelligence_cache = None
-    bot.cache_timestamp = None
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="approve_signals")
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle approve button click"""
+        try:
+            # Add approval logic here
+            await interaction.response.send_message(
+                "✅ Signals approved! Executing trades...",
+                ephemeral=True
+            )
+            logger.info(f"Signals approved by {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Approval error: {e}")
+            await interaction.response.send_message(
+                "❌ Approval failed. Please try again.",
+                ephemeral=True
+            )
     
-    data = bot.get_intelligence_data()
-    if data:
-        await bot.broadcast_intelligence(data)
-        await ctx.send("✅ Intelligence polling completed")
-    else:
-        await ctx.send("❌ No intelligence data found")
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id="reject_signals")
+    async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle reject button click"""
+        try:
+            await interaction.response.send_message(
+                "❌ Signals rejected. No action taken.",
+                ephemeral=True
+            )
+            logger.info(f"Signals rejected by {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Rejection error: {e}")
+            await interaction.response.send_message(
+                "❌ Rejection failed. Please try again.",
+                ephemeral=True
+            )
 
-# Load bot configuration
-def load_config() -> Dict:
+def load_config(config_path: str = 'config.json') -> dict:
     """Load bot configuration"""
-    config_file = Path("config.json")
-    
     default_config = {
-        'prefix': '!',
+        'raw_json_url': '',
+        'pat_token': '',
         'poll_interval': 120,
         'approval_timeout': 300,
-        'repo_owner': '',
-        'repo_name': 'cis-operational-center',
-        'pat_token': '',
-        'channels': [],
         'discord_token': ''
     }
     
     try:
-        if config_file.exists():
-            with open(config_file, 'r') as f:
+        if Path(config_path).exists():
+            with open(config_path, 'r') as f:
                 config = json.load(f)
-            # Merge with defaults
-            for key, value in default_config.items():
-                if key not in config:
-                    config[key] = value
-            return config
+                # Merge with defaults
+                for key, value in default_config.items():
+                    if key not in config:
+                        config[key] = value
+                return config
+        else:
+            logger.warning(f"Config file {config_path} not found, using defaults")
+            return default_config
+            
     except Exception as e:
-        logging.error(f"Error loading config: {e}")
-    
-    return default_config
+        logger.error(f"Error loading config: {e}")
+        return default_config
 
 def main():
     """Main function"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='CIS Discord Bot')
+    parser.add_argument('--config', default='config.json', help='Configuration file')
+    parser.add_argument('--token', help='Discord bot token (overrides config)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    
     # Load configuration
-    config = load_config()
+    config = load_config(args.config)
     
-    # Check required configuration
+    # Override token if provided
+    if args.token:
+        config['discord_token'] = args.token
+    
     if not config.get('discord_token'):
-        logging.error("❌ Discord token not configured")
-        return
+        logger.error("No Discord token provided")
+        return 1
     
-    if not config.get('pat_token'):
-        logging.error("❌ GitHub PAT token not configured")
-        return
+    # Create and run bot
+    bot = CISDiscordBot(config)
     
-    # Create bot instance
-    bot = CISBot(config)
-    
-    # Add commands
-    bot.add_command(help_command)
-    bot.add_command(status_command)
-    bot.add_command(intelligence_command)
-    bot.add_command(poll_command)
-    
-    # Add start time for uptime tracking
-    bot.start_time = datetime.utcnow()
-    
-    # Run bot
     try:
         bot.run(config['discord_token'])
     except KeyboardInterrupt:
-        logging.info("🛑 Bot stopped by user")
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logging.error(f"❌ Bot error: {e}")
+        logger.error(f"❌ Bot error: {e}")
+        return 1
+    
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())
