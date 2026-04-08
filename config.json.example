@@ -1,0 +1,16 @@
+{
+  "discord_token": "YOUR_DISCORD_BOT_TOKEN",
+  "prefix": "!",
+  "pat_token": "YOUR_GITHUB_PAT_TOKEN",
+  "repo_owner": "YOUR_GITHUB_USERNAME",
+  "repo_name": "cis-operational-center",
+  "poll_interval": 120,
+  "approval_timeout": 300,
+  "channels": [],
+  "log_level": "INFO",
+  "termux": {
+    "enable_wake_lock": true,
+    "enable_notifications": true,
+    "auto_start": true
+  }
+}
